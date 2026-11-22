@@ -1,0 +1,17 @@
+# Sensitivity: GCS non-linearity flagged (Box-Tidwell p=0.004, link test p=0.04). Main model unchanged; alternatives shown for comparison only.
+suppressMessages({library(tidyverse); library(broom); library(pROC); library(ResourceSelection)})
+dat <- readRDS("data/clean/stroke_clean.rds") |> select(-rn); dat$dead <- as.integer(dat$outcome=="Dead")
+print(table(gcs=dat$gcs, outcome=dat$outcome))
+dat$gcs_cat <- cut(dat$gcs, c(2,8,12,15), labels=c("Severe 3-8","Moderate 9-12","Mild 13-15"))
+dat$gcs_cat <- relevel(dat$gcs_cat, ref="Mild 13-15")
+print(table(dat$gcs_cat, dat$outcome))
+mods <- list(linear = glm(dead~sex+gcs, binomial, dat), gcs_quad = glm(dead~sex+gcs+I(gcs^2), binomial, dat), gcs_cat = glm(dead~sex+gcs_cat, binomial, dat))
+res <- imap_dfr(mods, \(m, nm){ r <- roc(dat$dead, fitted(m), quiet=TRUE, direction="<")
+  tibble(model=nm, AIC=AIC(m), AUC=as.numeric(auc(r)), HL_p=hoslem.test(dat$dead, fitted(m), g=10)$p.value, link_p=coef(summary(glm(dead~lp+I(lp^2), binomial, mutate(dat, lp=predict(m)))))["I(lp^2)",4])})
+print(res); write_csv(res,"output/tables/sensitivity_gcs_models.csv")
+ci <- confint.default(mods$gcs_cat)
+st <- tidy(mods$gcs_cat) |> filter(term!="(Intercept)") |> transmute(term, B=estimate, OR=exp(estimate), lo=exp(ci[term,1]), hi=exp(ci[term,2]), p=p.value)
+print(st); write_csv(st,"output/tables/sensitivity_gcs_cat_or.csv")
+# Do other candidates matter once GCS is categorical?
+cand <- c("sex","hr","hb","wbc","na","cbs","dyslipidaemia","referralcase","stroketype")
+f <- glm(reformulate(c("gcs_cat",cand),"dead"), binomial, dat); print(drop1(f, test="LRT"))

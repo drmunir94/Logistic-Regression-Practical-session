@@ -1,0 +1,12 @@
+# patient-level data (not published)
+*.dta
+stroke-fatality.csv
+data/
+*.rds
+# outputs containing registration numbers
+output/tables/flagged_values.csv
+report.html
+# misc
+.DS_Store
+.Rhistory
+.Rproj.user/

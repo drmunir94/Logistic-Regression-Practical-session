@@ -1,0 +1,80 @@
+# A stage: multivariable model, fit assessment
+suppressMessages({library(tidyverse); library(broom); library(pROC); library(ResourceSelection)})
+dat <- readRDS("data/clean/stroke_clean.rds") |> select(-rn); dat$dead <- as.integer(dat$outcome=="Dead")
+uv <- readRDS("output/tables/univariable.rds")
+cand <- uv$lrp$variable[uv$lrp$candidate]; cat("Candidates:", cand, "\n")
+# GCS enters as a block (linear + quadratic) because linearity in the logit failed; block is always retained
+cand_o <- setdiff(cand,"gcs")
+full <- glm(reformulate(c("gcs","I(gcs^2)",cand_o),"dead"), data=dat, family=binomial)
+# backward elimination by LR test (remove largest p > 0.05)
+m <- full; steps <- list()
+repeat{
+  d <- drop1(m, test="LRT"); d <- d[-1,]; d <- d[!rownames(d) %in% c("gcs","I(gcs^2)"),];
+  if (nrow(d)==0) break; w <- rownames(d)[which.max(d$`Pr(>Chi)`)]
+  if (max(d$`Pr(>Chi)`) <= 0.05) break
+  steps[[length(steps)+1]] <- tibble(removed=w, p=max(d$`Pr(>Chi)`))
+  m <- update(m, as.formula(paste(". ~ . -", w)))
+}
+print(bind_rows(steps)); cat("Retained:", attr(terms(m),"term.labels"), "\n")
+# confounding check: re-add each removed candidate, % change in retained coefficients
+ret <- attr(terms(m),"term.labels")
+conf <- map_dfr(setdiff(cand_o, ret), \(v){ m2 <- update(m, as.formula(paste(". ~ . +", v)))
+  b0 <- coef(m)[-1]; b1 <- coef(m2)[names(b0)]; b0 <- b0; tibble(added=v, max_pct_change=max(abs((b1-b0)/b0))*100)})
+print(conf)
+# add back sex? (confounder if >20% change) -> keep preliminary final model = m unless flagged
+final <- m
+write_rds(final, "output/tables/final_model.rds")
+ci <- confint.default(final)
+mv <- tidy(final) |> filter(term!="(Intercept)") |> transmute(term, B=estimate, SE=std.error, OR=exp(estimate), OR_lo=exp(ci[term,1]), OR_hi=exp(ci[term,2]), p=p.value)
+write_csv(mv,"output/tables/multivariable_results.csv"); print(mv |> mutate(across(where(is.numeric), ~round(.x,4))))
+# crude vs adjusted for the same variables
+cat("Full model (10 candidates) vs final LR test:\n"); print(anova(final, full, test="LRT"))
+# Multicollinearity: VIF (numeric/dummy-based, GVIF not needed for 1-df terms)
+X <- model.matrix(update(final, . ~ . - gcs - I(gcs^2) + gc + I(gc^2), data=transform(dat, gc=gcs-mean(gcs))))[,-1]; vif <- sapply(seq_len(ncol(X)), \(j) 1/(1-summary(lm(X[,j]~X[,-j]))$r.squared)); names(vif) <- colnames(X)
+print(round(vif,2)); write_csv(tibble(term=names(vif), VIF=vif),"output/tables/vif.csv")
+# Specification (link) test
+lp <- predict(final, type="link"); lt <- glm(dead ~ lp + I(lp^2), data=dat, family=binomial)
+cat("Link test p (lp^2):", coef(summary(lt))["I(lp^2)",4], "\n")
+# Linearity re-check within final model for numeric terms (Box-Tidwell)
+for (v in setdiff(intersect(ret, names(dat |> select(where(is.numeric)))),"gcs")) { d<-dat; d$xlx<-d[[v]]*log(d[[v]])
+  mm <- update(final, as.formula(paste(". ~ . + xlx")), data=d); cat("BT", v, "p =", round(coef(summary(mm))["xlx",4],4), "\n")}
+# Fit
+p_hat <- fitted(final)
+hl10 <- hoslem.test(dat$dead, p_hat, g=10); print(hl10)
+nullm <- glm(dead~1,data=dat,family=binomial)
+lr <- 2*(logLik(final)-logLik(nullm)); n <- nrow(dat)
+r2_mcf <- 1-as.numeric(logLik(final)/logLik(nullm)); r2_cs <- 1-exp((2/n)*(logLik(nullm)-logLik(final)))
+r2_nag <- as.numeric(r2_cs/(1-exp((2/n)*logLik(nullm))))
+cat("LR chi2 =", round(lr,2), " df =", length(coef(final))-1, " McFadden =", round(r2_mcf,3), " Nagelkerke =", round(r2_nag,3), "\n")
+# Diagnostics
+infl <- tibble(id=seq_len(n), p_hat=p_hat, leverage=hatvalues(final), dbeta=cooks.distance(final),
+               pearson=residuals(final,"pearson"), dchisq=residuals(final,"pearson")^2/(1-hatvalues(final)), dead=dat$dead)
+k <- length(coef(final)); lev_cut <- 2*k/n
+cat("Leverage cutoff:", round(lev_cut,3), "\n")
+flag <- infl |> filter(leverage>lev_cut | dbeta>1 | dchisq>4) ; write_csv(flag,"output/tables/influential_obs.csv")
+cat("Flagged:", nrow(flag), " (lev>cut:", sum(infl$leverage>lev_cut), "; dbeta>1:", sum(infl$dbeta>1), "; dchisq>4:", sum(infl$dchisq>4), ")\n")
+print(infl |> arrange(desc(dbeta)) |> head(8))
+th <- theme_minimal()
+pl <- function(y, lab, h=NULL) ggplot(infl, aes(p_hat, .data[[y]])) + geom_point(aes(colour=factor(dead)), alpha=.7) + {if(!is.null(h)) geom_hline(yintercept=h, linetype=2, colour="red")} + labs(x="Predicted probability", y=lab, colour="Dead") + th
+suppressMessages(library(patchwork))
+g <- (pl("leverage","Leverage",lev_cut) + pl("dbeta","dBeta (Cook's)",1)) / (pl("dchisq","dChi-square",4) + pl("pearson","Pearson residual")) + plot_layout(guides="collect")
+ggsave("output/figures/diagnostics.png", g, width=10, height=8, dpi=150)
+# ROC / AUC
+roc_obj <- roc(dat$dead, p_hat, quiet=TRUE, direction="<"); auc_ci <- ci.auc(roc_obj)
+cat("AUC =", round(auc(roc_obj),3), " 95% CI", round(auc_ci[1],3), "-", round(auc_ci[3],3), "\n")
+gr <- ggroc(roc_obj, colour="steelblue", linewidth=1) + geom_abline(intercept=1, slope=1, linetype=2) + th +
+  labs(title=sprintf("ROC curve, AUC = %.3f (95%% CI %.3f-%.3f)", auc(roc_obj), auc_ci[1], auc_ci[3]), x="Specificity", y="Sensitivity")
+ggsave("output/figures/roc.png", gr, width=6, height=5, dpi=150)
+# Classification
+youden <- coords(roc_obj, "best", best.method="youden", ret="threshold")$threshold[1]
+cls <- map_dfr(c(0.5, youden), \(cut){ pred <- as.integer(p_hat>=cut); tp<-sum(pred==1&dat$dead==1); tn<-sum(pred==0&dat$dead==0); fp<-sum(pred==1&dat$dead==0); fn<-sum(pred==0&dat$dead==1)
+  tibble(cutoff=round(cut,3), TP=tp, FP=fp, FN=fn, TN=tn, accuracy=(tp+tn)/n, sensitivity=tp/(tp+fn), specificity=tn/(tn+fp), PPV=tp/(tp+fp), NPV=tn/(tn+fn))})
+print(cls); write_csv(cls,"output/tables/classification.csv")
+# HL with g=8 for robustness, and fit summary
+hl8 <- hoslem.test(dat$dead, p_hat, g=8)
+fit <- tibble(metric=c("LR chi-square","LR df","LR p","McFadden R2","Nagelkerke R2","Hosmer-Lemeshow chi2 (g=10)","HL df","HL p (g=10)","HL p (g=8)","AUC","AUC 95% LCL","AUC 95% UCL","Link test p (lp^2)","N","Events"),
+ value=c(as.numeric(lr), k-1, pchisq(as.numeric(lr),k-1,lower.tail=FALSE), r2_mcf, r2_nag, unname(hl10$statistic), unname(hl10$parameter), hl10$p.value, hl8$p.value, as.numeric(auc(roc_obj)), auc_ci[1], auc_ci[3], coef(summary(lt))["I(lp^2)",4], n, sum(dat$dead)))
+write_csv(fit,"output/tables/fit_summary.csv"); print(fit)
+# Sensitivity: refit without influential observations (dbeta>1 or dchisq>4)
+drop <- infl$id[infl$dbeta>1 | infl$dchisq>4]; cat("Sensitivity dropping", length(drop), "obs\n")
+if (length(drop)>0){ ms <- update(final, data=dat[-drop,]); print(round(cbind(full=coef(final), drop=coef(ms), pct=100*(coef(ms)-coef(final))/coef(final)),3)) }
